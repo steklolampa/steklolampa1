@@ -1,0 +1,10 @@
+a = 1
+while a==1:
+ kurs = float(input("Скільки коштує один Bitcoin в Долларах США: "))
+ dollar = float(input("Скільки Долларів США божаєте обміняти: "))
+ print ("Ви можете купити: ")
+ result = dollar / kurs
+ print (round(result, 7), 'Bitcoin')
+
+
+Testing online:https://replit.com
