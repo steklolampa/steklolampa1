@@ -1,0 +1,833 @@
+
+# -*- coding: utf-8 -*-
+"""
+Агентно-ориентированная сетевая модель нейронов — Версия 3.0 (строго по ТЗ).
+
+Основные реализации:
+- Строгий порядок стадий тика: process_phase_transitions → publish_phases → barrier_copy_delete → i-логика → j-интеграция → проверки → завершающая проверка передачи.
+- Смена фаз ТОЛЬКО в process_phase_transitions() по флагам прошлого тика.
+- PublishedPhase фиксируется на тик для исключения гонок.
+- Точный учёт Tij кратно kt, сброс при k5=0.
+- Пластичность и зеркалирование значений по правилам ТЗ.
+- Внутренняя интеграция Nc в режиме BUDGET (B = kt), глобальное dt не меняется.
+- Инициализация параметров и топологии строго по приложениям ТЗ.
+- Графики W(t) по нейронам и Cij(t) по всем синапсам; текстовый лог.
+"""
+import math
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# =========================
+# 6. Константы системы (ТЗ)
+# =========================
+kt: float = 0.001  # 2.1 Глобальный тик, сек
+SIM_TIME: float = 30.0
+STEPS: int = int(SIM_TIME / kt)
+k1 = 0.3  # 1.2 / 6 Коэфф обучения
+k2 = 0.3  # адаптация порога
+k3 = 0.3  # адаптация рефрактерности
+k4 = 0.3  # преобразование (Nc)
+EAPS_PLUS = 1.0  # номинальный порог
+DTN_PRIME_NOM = 0.05  # Δtn′ номинальная рефрактерность
+EPS = 1e-12  # анти-деление
+
+# 4.2.2 внутренние константы Nc
+alpha = 0.1
+beta = 0.99
+dtmin = 0.0001
+dtmax = 0.01
+Dref_default = 0.1
+
+# Входной сигнал (8.4) — базовый (для Nc, например ID1)
+A_signal = 25.0
+omega_signal = 15.0
+phi0_signal = 10.0
+
+# Дополнительный сигнал для нового Nc(0)
+A_signal_ID0 = 20.0
+omega_signal_ID0 = 30.0
+phi0_signal_ID0 = 20.0
+
+# ---------------------------------------------
+# Вспомогательные перечисления и типы фаз
+# ---------------------------------------------
+class PhaseEnum:
+    Reception = "Reception"
+    Transmission_Absolute = "Transmission_Absolute"
+
+# ---------------------------------------------
+# 1.3. Синапс как динамическая запись (конец)
+# ---------------------------------------------
+@dataclass
+class SynEnd:
+    IDi: str
+    IDj: str
+    Kij: float
+    Gi_t: float
+    Gi_t_1: float
+    Cij_t: float
+    Cij_t_1: float
+    Tij: float
+    k5: int
+    Flag_Delete: bool
+    Flag_Copy: bool
+    pair_uuid: str
+    IDs: int      # локальный индекс на стороне i
+    IDs_prime: int  # локальный индекс на стороне j (для сортировки/детерминизма)
+
+# -------------------------------------------------
+# 1.2. Нейрон-агент (общая схема) с динамическими
+#      полями, флагами фаз и методами стадий
+# -------------------------------------------------
+@dataclass
+class Neuron:
+    ID: str
+    Class: str  # "Nc" | "Nn+" | "Nn-"
+    # Статические (у агента, по ТЗ)
+    k1: float = k1
+    k2: float = k2
+    k3: float = k3
+    k4: float = k4
+    Eaps_plus: float = EAPS_PLUS
+    eps: float = EPS
+    # Динамические — фаза
+    Phase: str = PhaseEnum.Reception
+    PublishedPhase: str = PhaseEnum.Reception
+    # Динамические — временные параметры
+    t0: float = 0.0
+    t1: float = 0.0
+    tn: float = 0.0
+    tk: float = 0.0
+    Dt: float = 0.0   # Δt = t1 - t0 — последняя завершенная приемная
+    Dt_prime: float = DTN_PRIME_NOM  # Δt' = tk - tn — последняя завершенная передача
+    # Динамические — частоты
+    W_t: float = 10.0
+    W_t_1: float = 5.0
+    # Динамические — пороги
+    Eap_plus: float = 1.0
+    Eap_minus: float = -1.0
+    # Динамические — информация
+    F_t: float = 0.0       # для Nn: суммарно за текущий тик
+    F_t1: float = 0.0      # для Nn: накоплено за фазу приёма
+    F_t0: float = 0.1      # остаток на начало текущего цикла
+    F_t0_1: float = 0.1    # остаток на начало предыдущего цикла
+    # Только для Nc
+    Fn_t1: float = 0.0
+    # Внутренние переменные Nc (4.2.1, 4.2.2)
+    dt_internal: float = 0.0
+    delta_tc: float = 0.0
+    a_prev: float = 0.0
+    D_prev: float = 0.001
+    Dref: float = Dref_default
+    Amax_prev: float = 1.0
+    phi0: float = phi0_signal  # индивидуальная фаза
+    # Связи
+    outgoing_synapses: List[SynEnd] = field(default_factory=list)  # m
+    incoming_synapses: List[SynEnd] = field(default_factory=list)  # n
+    # Флаги фаз (должны применяться только на следующем тике)
+    flag_update_t0: bool = False
+    flag_update_tn: bool = False
+    # Журналы для графиков/логов
+    W_traj: List[float] = field(default_factory=list)
+
+    # ============= ВСПОМОГАТЕЛЬНОЕ ============
+    def sign_class(self) -> int:
+        if self.Class == "Nn-":
+            return -1
+        return +1  # Nn+ и Nc => +1
+
+    # ======================
+    # Стадия 1: переходы фаз
+    # ======================
+    def process_phase_transitions(self, dt: float):
+        # Применяем флаги, выставленные в прошлом тике
+        # Приоритет: флаги взаимоисключительные (инвариант)
+        if self.flag_update_t0:
+            # ВХОД В ПРИЁМ (4.1.1 для Nn или 4.2.1 для Nc)
+            # 1) Сохранение истории
+            self.W_t_1 = self.W_t
+            self.F_t0_1 = self.F_t0
+            # 2) Δt и Δt'
+            self.Dt = max(0.0, self.t1 - self.t0)
+            self.Dt_prime = max(0.0, self.tk - self.tn)
+            # 3) W(t) фиксируем до следующего входа в приём
+            denom = self.Dt + self.Dt_prime
+            self.W_t = 1.0 / max(self.eps, denom)
+            # 4) Остаточная информация
+            arg = min(700.0, self.W_t * self.Dt_prime)
+            if self.Class == "Nc":
+                self.F_t0 = self.Fn_t1 * math.exp(-arg)
+            else:
+                self.F_t0 = self.F_t1 * math.exp(-arg)
+            # 5) Адаптация порогов
+            A = self.F_t0 - self.F_t0_1
+            self.Eap_plus = self.Eaps_plus * (1.0 + self.k2 * math.tanh(A))
+            if self.Eap_plus <= 0.0:
+                self.Eap_plus = 0.001
+            self.Eap_minus = -self.Eap_plus
+            # 6) Адаптация рефрактерности
+            B = self.W_t - self.W_t_1
+            Dt_p = DTN_PRIME_NOM * (1.0 + self.k3 * math.tanh(B))
+            if Dt_p < 0.0:
+                Dt_p = kt
+            # выравнивание по сетке kt
+            Dt_p = math.ceil(Dt_p / kt) * kt
+            self.Dt_prime = Dt_p
+            # 7) Обновление цикла
+            if self.Class == "Nc":
+                self.Fn_t1 = self.F_t0
+                # Доп инициализация для Nc
+                self.t0 = dt
+                self.dt_internal = 0.0
+                self.delta_tc = 0.0
+                self.a_prev = 0.0
+                self.D_prev = 0.001
+                self.Dref = Dref_default
+                self.Amax_prev = 1.0
+                # phi0 сохраняем индивидуальную
+            else:
+                self.F_t1 = self.F_t0
+                self.F_t = 0.0
+                self.t0 = dt
+            # 8) Фаза := Reception
+            self.Phase = PhaseEnum.Reception
+            # 9) Сброс флага
+            self.flag_update_t0 = False
+
+        if self.flag_update_tn:
+            # ВХОД В ПЕРЕДАЧУ (4.1.5 / для Nc аналогично)
+            self.tn = self.t1 + kt
+            self.tk = self.tn + self.Dt_prime
+            self.Phase = PhaseEnum.Transmission_Absolute
+            self.flag_update_tn = False
+
+    # ==========================
+    # Стадия 4: i-логика передачи
+    # ==========================
+    def compute_outgoing(self, dt: float, registry: Dict[str, Tuple['Neuron', 'Neuron']]):
+        # m и n считаются после барьера на текущем тике (инвариант)
+        m = len(self.outgoing_synapses)
+        if m == 0:
+            return  # участвует, но действий нет
+
+        # детерминированный порядок обхода: по возрастанию IDs
+        for syn in sorted(self.outgoing_synapses, key=lambda s: s.IDs):
+            # Найдём j-нейрон по реестру
+            i_ref, j_ref = registry[syn.pair_uuid]
+            j_neuron = j_ref
+
+            # Проверка синхронизации
+            if j_neuron.PublishedPhase == PhaseEnum.Reception:
+                syn.k5 = 1
+                syn.Tij = syn.Tij + kt  # ровно кратно kt
+            else:
+                syn.k5 = 0
+                syn.Tij = 0.0
+
+            # Зеркалирование по правилам
+            j_end: Optional[SynEnd] = None
+            for s in j_neuron.incoming_synapses:
+                if s.pair_uuid == syn.pair_uuid:
+                    j_end = s
+                    break
+            if j_end is None:
+                continue  # безопасность
+
+            if syn.k5 == 1:
+                # Сохранение истории (только на i-стороне)
+                syn.Gi_t_1 = syn.Gi_t
+                syn.Cij_t_1 = syn.Cij_t
+
+                # Расчёт Gi
+                arg = min(700.0, self.W_t * syn.Tij)
+                if self.Class == "Nc":
+                    base = self.Fn_t1
+                else:
+                    base = self.F_t1
+                Gi_val = (base / (m + self.eps)) * (1.0 - math.exp(-arg))
+                Gi_val = self.sign_class() * abs(Gi_val)
+                syn.Gi_t = Gi_val
+
+                # Пластичность
+                S_z = abs(syn.Gi_t) - abs(syn.Gi_t_1)
+                syn.Cij_t = syn.Cij_t_1 + self.k1 * math.tanh(S_z)
+                if syn.Cij_t < 0.0:
+                    syn.Cij_t = 0.0
+
+                # Флаги copy/delete
+                if syn.Cij_t < 0.2:
+                    syn.Flag_Delete = True
+                if syn.Cij_t > 2.0:
+                    syn.Flag_Copy = True
+
+                # Зеркалирование при k5 = 1
+                j_end.Gi_t = syn.Gi_t
+                j_end.Cij_t = syn.Cij_t
+                j_end.k5 = syn.k5
+                j_end.Tij = syn.Tij
+                j_end.Flag_Copy = syn.Flag_Copy
+                j_end.Flag_Delete = syn.Flag_Delete
+            else:
+                # При k5 = 0: зеркалируем только k5 и Tij
+                j_end.k5 = syn.k5
+                j_end.Tij = syn.Tij
+
+    # ==========================================
+    # Стадия 5: j-сторона — интеграции приёмников
+    # ==========================================
+    def integrate_incoming(self):
+        # Только для Nn в Reception
+        if self.PublishedPhase != PhaseEnum.Reception:
+            return
+        if self.Class.startswith("Nn"):
+            n = len(self.incoming_synapses)
+            if n == 0:
+                self.F_t = 0.0
+            else:
+                total = 0.0
+                for syn in sorted(self.incoming_synapses, key=lambda s: s.IDs_prime):
+                    total += syn.k5 * syn.Kij * syn.Cij_t * syn.Gi_t
+                self.F_t = total
+            # Накопление за фазу
+            self.F_t1 = self.F_t1 + self.F_t
+
+    # Внутренняя сенсорная интеграция Nc, режим BUDGET
+    def integrate_sensor(self, dt: float):
+        if self.PublishedPhase != PhaseEnum.Reception:
+            return
+        if self.Class != "Nc":
+            return
+
+        B = kt  # бюджет на тик
+        # Внутри цикла dt_internal накапливается до B
+        while self.dt_internal < B - 1e-15:
+            # --- локальное время внутри тика ---
+            t_local = dt + self.dt_internal
+
+            # Индивидуальный сигнал для ID0, иначе — базовый
+            if self.ID == "ID0":
+                Ac = A_signal_ID0 * math.sin(omega_signal_ID0 * t_local + phi0_signal_ID0)
+            else:
+                Ac = A_signal * math.sin(omega_signal * t_local + self.phi0)
+
+            # Адаптивная нормализация
+            Amax_c = max(beta * self.Amax_prev, abs(Ac))
+            ac = abs(Ac) / max(self.eps, Amax_c)
+
+            # Оценка изменчивости
+            Dc = alpha * abs(ac - self.a_prev) + (1.0 - alpha) * self.D_prev
+
+            # Адаптивный шаг
+            Sc = min(1.0, Dc / self.Dref)
+            delta_tc = dtmin + (1.0 - Sc) * (dtmax - dtmin)
+
+            # Накопление — dt' и Fn(t1)
+            self.dt_internal += delta_tc
+            self.Fn_t1 += self.k4 * ac * delta_tc
+
+            # Проверка порога
+            if self.Fn_t1 >= self.Eap_plus:
+                self.flag_update_tn = True
+                v = math.ceil(self.dt_internal / kt)
+                if v < 1:
+                    v = 1
+                self.t1 = self.t0 + v * kt
+                # Обновление для следующей итерации вне цикла
+                self.a_prev = ac
+                self.D_prev = Dc
+                self.Amax_prev = Amax_c
+                break
+
+            # Обновление итеративных переменных
+            self.a_prev = ac
+            self.D_prev = Dc
+            self.Amax_prev = Amax_c
+
+    # ==========================================
+    # Стадия 6: Пороговые проверки и флаги фаз Nn
+    # ==========================================
+    def check_thresholds_or_completion(self, dt: float):
+        if self.PublishedPhase != PhaseEnum.Reception:
+            return
+        if self.Class.startswith("Nn"):
+            # Условия 4.1.4
+            F_t = self.F_t
+            Ft1 = self.F_t1
+            if F_t == 0.0 and Ft1 == 0.0:
+                self.flag_update_tn = True
+                self.t1 = dt
+                self.F_t1 = 0.001
+            elif F_t == 0.0 and (self.Eap_minus < Ft1 < self.Eap_plus):
+                self.flag_update_tn = True
+                self.t1 = dt
+            elif Ft1 >= self.Eap_plus:
+                self.flag_update_tn = True
+                self.t1 = dt
+            elif Ft1 <= self.Eap_minus:
+                self.flag_update_tn = True
+                self.t1 = dt
+                if self.Class == "Nn+":
+                    self.F_t1 = 0.001
+                elif self.Class == "Nn-":
+                    self.F_t1 = self.Eap_minus
+            else:
+                pass
+        elif self.Class == "Nc":
+            # Для Nc порог уже проверяется в integrate_sensor
+            pass
+
+    # =========================================================
+    # Стадия 7: Проверка завершения передачи (для Nn и Nc общая)
+    # =========================================================
+    def finalize_transmission_check(self, dt: float):
+        if self.PublishedPhase != PhaseEnum.Transmission_Absolute:
+            return
+        if dt < self.tk:
+            return
+        else:
+            self.flag_update_t0 = True
+
+
+# ---------------------------------------------
+# 5. Реестр соответствий синапсов
+# SynapseRegistry[pair_uuid] = (i_ref, j_ref)
+# ---------------------------------------------
+class SynapseRegistry:
+    def __init__(self):
+        self.map: Dict[str, Tuple[Neuron, Neuron]] = {}
+
+    def register(self, pair_uuid: str, i_ref: Neuron, j_ref: Neuron):
+        self.map[pair_uuid] = (i_ref, j_ref)
+
+    def remove(self, pair_uuid: str):
+        if pair_uuid in self.map:
+            del self.map[pair_uuid]
+
+
+# ---------------------------------------------
+# Барьер copy/delete — стадия 3
+# ---------------------------------------------
+def barrier_copy_delete(agents: List[Neuron], registry: SynapseRegistry):
+    # Соберём все концы (оба направления) в единый список
+    all_i_ends: List[SynEnd] = []
+    for n in agents:
+        all_i_ends.extend(n.outgoing_synapses)
+
+    # Сбор флагов по парам
+    delete_set = set()
+    copy_set = set()
+    for syn in all_i_ends:
+        if syn.Flag_Delete:
+            delete_set.add(syn.pair_uuid)
+        if syn.Flag_Copy:
+            copy_set.add(syn.pair_uuid)
+
+    # ---- Атомарное удаление ----
+    for puid in delete_set:
+        if puid not in registry.map:
+            continue
+        i_ref, j_ref = registry.map[puid]
+        i_ref.outgoing_synapses = [s for s in i_ref.outgoing_synapses if s.pair_uuid != puid]
+        j_ref.incoming_synapses = [s for s in j_ref.incoming_synapses if s.pair_uuid != puid]
+        registry.remove(puid)
+
+    # ---- Атомарное копирование ----
+    for puid in copy_set:
+        if puid not in registry.map:
+            continue
+        i_ref, j_ref = registry.map[puid]
+        orig_i: Optional[SynEnd] = None
+        for s in i_ref.outgoing_synapses:
+            if s.pair_uuid == puid:
+                orig_i = s
+                break
+        orig_j: Optional[SynEnd] = None
+        for s in j_ref.incoming_synapses:
+            if s.pair_uuid == puid:
+                orig_j = s
+                break
+        if orig_i is None or orig_j is None:
+            continue
+        new_uuid = str(uuid.uuid4())
+        new_i = SynEnd(
+            IDi=orig_i.IDi, IDj=orig_i.IDj, Kij=orig_i.Kij,
+            Gi_t=orig_i.Gi_t, Gi_t_1=orig_i.Gi_t_1,
+            Cij_t=0.2, Cij_t_1=orig_i.Cij_t_1,
+            Tij=0.0, k5=0,
+            Flag_Delete=False, Flag_Copy=False,
+            pair_uuid=new_uuid,
+            IDs=(max([s.IDs for s in i_ref.outgoing_synapses] + [0]) + 1),
+            IDs_prime=(max([s.IDs_prime for s in j_ref.incoming_synapses] + [0]) + 1)
+        )
+        new_j = SynEnd(
+            IDi=orig_j.IDi, IDj=orig_j.IDj, Kij=orig_j.Kij,
+            Gi_t=orig_j.Gi_t, Gi_t_1=orig_j.Gi_t_1,
+            Cij_t=0.2, Cij_t_1=orig_j.Cij_t_1,
+            Tij=0.0, k5=0,
+            Flag_Delete=False, Flag_Copy=False,
+            pair_uuid=new_uuid,
+            IDs=new_i.IDs, IDs_prime=new_i.IDs_prime
+        )
+        orig_i.Cij_t = max(0.0, orig_i.Cij_t - 0.2)
+        orig_j.Cij_t = max(0.0, orig_j.Cij_t - 0.2)
+        i_ref.outgoing_synapses.append(new_i)
+        j_ref.incoming_synapses.append(new_j)
+        registry.register(new_uuid, i_ref, j_ref)
+
+    # Сброс флагов
+    for syn in all_i_ends:
+        syn.Flag_Delete = False
+        syn.Flag_Copy = False
+    for n in agents:
+        for s in n.incoming_synapses:
+            s.Flag_Delete = False
+            s.Flag_Copy = False
+
+
+# ---------------------------------------------
+# Инициализация сети (8.)
+# ---------------------------------------------
+NEW_SYNS_LOG: List[str] = []  # для печати новых 6 связей
+
+def build_network() -> Tuple[List[Neuron], SynapseRegistry]:
+    # Создаем 6 нейронов (добавлен ID0 — Nc)
+    ID0 = "ID0"
+    ID1 = "ID1"
+    ID2 = "ID2"
+    ID3 = "ID3"
+    ID4 = "ID4"
+    ID5 = "ID5"
+
+    n0 = Neuron(ID=ID0, Class="Nc",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0,
+                phi0=phi0_signal_ID0)
+    n1 = Neuron(ID=ID1, Class="Nc",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0,
+                phi0=phi0_signal)
+    n2 = Neuron(ID=ID2, Class="Nn+",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0)
+    n3 = Neuron(ID=ID3, Class="Nn-",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0)
+    n4 = Neuron(ID=ID4, Class="Nn+",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0)
+    n5 = Neuron(ID=ID5, Class="Nn+",
+                Phase=PhaseEnum.Reception,
+                W_t=10.0, W_t_1=5.0,
+                Eap_plus=1.0, Eaps_plus=1.0, Eap_minus=-1.0)
+
+    agents = [n0, n1, n2, n3, n4, n5]
+
+    # Дополнительная инициализация первой приёмной длительности (8.1)
+    # Δt0 := max(kt, 1/W(t) − Δtn′) => 1/10 - 0.05 = 0.05
+    Dt0 = max(kt, 1.0 / n1.W_t - DTN_PRIME_NOM)
+    Dt0 = math.ceil(Dt0 / kt) * kt
+    for n in agents:
+        n.t0 = 0.0
+        n.t1 = Dt0
+        n.tn = n.t1 + kt
+        n.tk = n.tn + DTN_PRIME_NOM
+        n.Dt_prime = DTN_PRIME_NOM
+        n.PublishedPhase = n.Phase
+
+    # Реестр
+    reg = SynapseRegistry()
+
+    # Утилита для добавления парных концов
+    def add_pair(i_ref: Neuron, j_ref: Neuron,
+                 Kij: float, Gi_t: float, Gi_t_1: float,
+                 Cij_t: float, Cij_t_1: float,
+                 Tij: float, k5: int,
+                 puid: str, IDs: int, IDs_prime: int):
+        i_end = SynEnd(
+            IDi=i_ref.ID, IDj=j_ref.ID, Kij=Kij,
+            Gi_t=Gi_t, Gi_t_1=Gi_t_1,
+            Cij_t=Cij_t, Cij_t_1=Cij_t_1,
+            Tij=Tij, k5=k5,
+            Flag_Delete=False, Flag_Copy=False,
+            pair_uuid=puid,
+            IDs=IDs, IDs_prime=IDs_prime
+        )
+        j_end = SynEnd(
+            IDi=i_ref.ID, IDj=j_ref.ID, Kij=Kij,
+            Gi_t=Gi_t, Gi_t_1=Gi_t_1,
+            Cij_t=Cij_t, Cij_t_1=Cij_t_1,
+            Tij=Tij, k5=k5,
+            Flag_Delete=False, Flag_Copy=False,
+            pair_uuid=puid,
+            IDs=IDs, IDs_prime=IDs_prime
+        )
+        i_ref.outgoing_synapses.append(i_end)
+        j_ref.incoming_synapses.append(j_end)
+        reg.register(puid, i_ref, j_ref)
+
+    # Начальные значения Gi по источнику (8.2):
+    def gi_init_for_source(src_id: str) -> Tuple[float, float]:
+        if src_id == "ID3":
+            return (-0.2, -0.1)  # (Gi_t, Gi_t_1)
+        else:
+            return (0.2, 0.1)
+
+    # ---- Приложение A: создаём 26 синапсов (старые) ----
+    # Nc(1) → Nn+(2): 4
+    specs_12 = [
+        (1.4, 1.2, 1.1, "uuid_121", 121),
+        (1.4, 1.3, 1.2, "uuid_122", 122),
+        (1.4, 1.3, 1.2, "uuid_123", 123),
+        (1.4, 0.9, 0.8, "uuid_124", 124),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_12:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID1")
+        add_pair(n1, n2, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # Nc(1) → Nn-(3): 3
+    specs_13 = [
+        (1.0, 0.8, 0.7, "uuid_131", 131),
+        (1.0, 1.0, 0.9, "uuid_132", 132),
+        (1.0, 1.1, 1.0, "uuid_133", 133),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_13:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID1")
+        add_pair(n1, n3, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # Nc(1) → Nn+(4): 4
+    specs_14 = [
+        (1.4, 1.5, 1.4, "uuid_141", 141),
+        (1.4, 1.3, 1.2, "uuid_142", 142),
+        (1.4, 0.7, 0.6, "uuid_143", 143),
+        (1.4, 0.9, 0.8, "uuid_144", 144),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_14:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID1")
+        add_pair(n1, n4, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # Nn+(2) → Nn+(5): 4
+    specs_25 = [
+        (1.4, 1.8, 1.7, "uuid_251", 251),
+        (1.4, 0.7, 0.6, "uuid_252", 252),
+        (1.4, 1.35, 1.25, "uuid_253", 253),
+        (1.4, 0.95, 0.85, "uuid_254", 254),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_25:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID2")
+        add_pair(n2, n5, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # Nn-(3) → Nn+(5): 3
+    specs_35 = [
+        (1.0, 0.85, 0.75, "uuid_351", 351),
+        (1.0, 1.05, 0.95, "uuid_352", 352),
+        (1.0, 1.15, 1.05, "uuid_353", 353),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_35:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID3")
+        add_pair(n3, n5, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # Nn+(4) → Nn+(5): 4
+    specs_45 = [
+        (1.4, 1.85, 1.75, "uuid_451", 451),
+        (1.4, 0.75, 0.65, "uuid_452", 452),
+        (1.4, 1.4, 1.33, "uuid_453", 453),
+        (1.4, 0.99, 0.88, "uuid_454", 454),
+    ]
+    for Kij, Cij_t, Cij_t_1, puid, IDs in specs_45:
+        Gi_t, Gi_t_1 = gi_init_for_source("ID4")
+        add_pair(n4, n5, Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, 0.001, 1, puid, IDs, IDs)
+
+    # --------- УДАЛЕНО: обратные связи Nn+(5) → (2,3,4) ---------
+    # (блоки specs_52, specs_53, specs_54 полностью исключены)
+
+    # -------------------- ДОБАВЛЕННЫЕ 6 СВЯЗЕЙ ДЛЯ Nc(0) --------------------
+    # Исходные строки (Kij, Gi_t, Gi_t_1, Cij_t, Cij_t_1, Tij, k5, puid, IDs, IDs_prime)
+    # Nc(0) → Nn+(2): 2
+    add_pair(n0, n2, 1.0, 0.2, 0.1, 1.6, 0.6, 0.001, 1, "uuid_021", 21, 21)
+    NEW_SYNS_LOG.append("[ID0→ID2] Kij=1,   Gi=(0.2,0.1), Cij=(1.6,0.6), Tij=0.001, k5=1, uuid_021, IDs=021, IDs'=021'")
+    add_pair(n0, n2, 1.0, 0.2, 0.1, 1.0, 1.2, 0.001, 1, "uuid_022", 22, 22)
+    NEW_SYNS_LOG.append("[ID0→ID2] Kij=1,   Gi=(0.2,0.1), Cij=(1.0,1.2), Tij=0.001, k5=1, uuid_022, IDs=022, IDs'=022'")
+
+    # Nc(0) → Nn-(3): 2
+    add_pair(n0, n3, 1.4, -0.2, -0.1, 0.8, 1.7, 0.001, 1, "uuid_031", 31, 31)
+    NEW_SYNS_LOG.append("[ID0→ID3] Kij=1.4, Gi=(-0.2,-0.1), Cij=(0.8,1.7), Tij=0.001, k5=1, uuid_031, IDs=031, IDs'=031'")
+    add_pair(n0, n3, 1.4, -0.2, -0.1, 1.0, 1.9, 0.001, 1, "uuid_032", 32, 32)
+    NEW_SYNS_LOG.append("[ID0→ID3] Kij=1.4, Gi=(-0.2,-0.1), Cij=(1.0,1.9), Tij=0.001, k5=1, uuid_032, IDs=032, IDs'=032'")
+
+    # Nc(0) → Nn+(4): 2
+    add_pair(n0, n4, 1.73, 0.2, 0.1, 1.5, 1.7, 0.001, 1, "uuid_041", 41, 41)
+    NEW_SYNS_LOG.append("[ID0→ID4] Kij=1.73, Gi=(0.2,0.1), Cij=(1.5,1.7), Tij=0.001, k5=1, uuid_041, IDs=041, IDs'=041'")
+    add_pair(n0, n4, 1.73, 0.2, 0.1, 1.3, 1.5, 0.001, 1, "uuid_042", 42, 42)
+    NEW_SYNS_LOG.append("[ID0→ID4] Kij=1.73, Gi=(0.2,0.1), Cij=(1.3,1.5), Tij=0.001, k5=1, uuid_042, IDs=042, IDs'=042'")
+
+    # Дет. порядок списков
+    for n in agents:
+        n.outgoing_synapses = sorted(n.outgoing_synapses, key=lambda s: s.IDs)
+        n.incoming_synapses = sorted(n.incoming_synapses, key=lambda s: s.IDs_prime)
+
+    return agents, reg
+
+
+# ---------------------------------------------
+# Главный цикл симуляции (10.)
+# ---------------------------------------------
+def run_simulation():
+    agents, registry = build_network()
+
+    # Метрики/журналы
+    total_initial_syn = sum(len(n.outgoing_synapses) for n in agents)
+    copy_counter = 0
+    delete_counter = 0
+
+    # Карта историй Cij(t) по pair_uuid для графиков
+    cij_history: Dict[str, List[float]] = {}
+    for n in agents:
+        for s in n.outgoing_synapses:
+            if s.pair_uuid not in cij_history:
+                cij_history[s.pair_uuid] = []
+
+    # Журнал фазовых событий
+    phase_events: List[str] = []
+
+    # Инициализируем dt
+    x = 0
+    dt = x * kt
+
+    # Начальные частоты (для печати)
+    init_freqs = {n.ID: n.W_t for n in agents}
+
+    # Симуляция
+    for tick in range(STEPS):
+        dt = tick * kt
+
+        # 1. Применение флагов перехода (прошлого тика)
+        for n in agents:
+            n.process_phase_transitions(dt)
+
+        # 2. Публикация фаз
+        for n in agents:
+            n.PublishedPhase = n.Phase
+
+        # 3. Барьер copy/delete
+        pending_delete = set()
+        pending_copy = set()
+        for n in agents:
+            for s in n.outgoing_synapses:
+                if s.Flag_Delete:
+                    pending_delete.add(s.pair_uuid)
+                if s.Flag_Copy:
+                    pending_copy.add(s.pair_uuid)
+        barrier_copy_delete(agents, registry)
+        delete_counter += len(pending_delete)
+        copy_counter += len(pending_copy)
+
+        # 4. i-сторона (источники в передаче)
+        for n in agents:
+            if n.PublishedPhase == PhaseEnum.Transmission_Absolute:
+                n.compute_outgoing(dt, registry.map)
+
+        # 5. j-сторона (приёмники)
+        for n in agents:
+            if n.PublishedPhase == PhaseEnum.Reception:
+                if n.Class == "Nc":
+                    n.integrate_sensor(dt)
+                else:
+                    n.integrate_incoming()
+
+        # 6. Проверки порогов
+        for n in agents:
+            n.check_thresholds_or_completion(dt)
+
+        # 7. Проверка завершения передачи
+        for n in agents:
+            n.finalize_transmission_check(dt)
+
+        # Сбор историй
+        for n in agents:
+            n.W_traj.append(n.W_t)
+        for n in agents:
+            for s in n.outgoing_synapses:
+                if s.pair_uuid in cij_history:
+                    cij_history[s.pair_uuid].append(s.Cij_t)
+
+        # Журнал фазовых событий (минимальный)
+        for n in agents:
+            if n.flag_update_t0:
+                phase_events.append(f"[t={dt:.3f}] {n.ID}: flag_update_t0")
+            if n.flag_update_tn:
+                phase_events.append(f"[t={dt:.3f}] {n.ID}: flag_update_tn")
+
+    # Итоговые частоты
+    final_freqs = {n.ID: n.W_t for n in agents}
+
+    # Печать текстового лога (9.2)
+    print(f"Время симуляции: {SIM_TIME:.0f} c")
+    print(f"Базовый сигнал Nc (например, ID1): I1(t) = {A_signal}*sin({omega_signal}*t+{phi0_signal})")
+    print(f"Новый сигнал Nc(0): I2(t) = {A_signal_ID0}*sin({omega_signal_ID0}*t+{phi0_signal_ID0})")
+    print(f"Начальное количество синапсов: {total_initial_syn}")
+    total_final_syn = sum(len(n.outgoing_synapses) for n in agents)
+    print(f"Конечное количество синапсов: {total_final_syn}")
+    print(f"Удалено синапсов: {delete_counter}")
+    print(f"Скопировано синапсов: {copy_counter}")
+
+    # Вывод новых 6 синапсов (добавлено к логам)
+    if NEW_SYNS_LOG:
+        print("\nДобавленные связи для Nc(0):")
+        for line in NEW_SYNS_LOG:
+            print(" ", line)
+
+    print("\nНачальные частоты нейронов:")
+    for nid in ["ID0", "ID1", "ID2", "ID3", "ID4", "ID5"]:
+        print(f"  {nid}: {init_freqs[nid]:.3f} Гц")
+
+    print("Конечные частоты нейронов:")
+    for nid in ["ID0", "ID1", "ID2", "ID3", "ID4", "ID5"]:
+        print(f"  {nid}: {final_freqs[nid]:.3f} Гц")
+
+    # 9.1 Графики W(t) по каждому нейрону (отдельные)
+    fig1, axs = plt.subplots(6, 1, figsize=(10, 14), sharex=True)
+    ids_order = ["ID0", "ID1", "ID2", "ID3", "ID4", "ID5"]
+    id2neuron = {n.ID: n for n in agents}
+    t_axis = np.arange(STEPS) * kt
+    for idx, nid in enumerate(ids_order):
+        axs[idx].plot(t_axis, id2neuron[nid].W_traj)
+        axs[idx].set_ylabel(f"W(t) {nid} (Hz)")
+        axs[idx].grid(True, alpha=0.3)
+    axs[-1].set_xlabel("t, s")
+    fig1.suptitle("Траектории частот W(t) для нейронов ID0..ID5", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    # 9.1 / 9.3 Траектории Cij(t) по всем синапсам
+    plt.figure(figsize=(12, 7))
+    for puid, hist in cij_history.items():
+        plt.plot(np.arange(len(hist)) * kt, hist, linewidth=1)
+    plt.title("Траектории синаптических сил Cij(t) для всех синапсов (по pair_uuid)")
+    plt.xlabel("t, s")
+    plt.ylabel("Cij(t)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # (Опционально) печать нескольких событий фаз
+    if phase_events:
+        print("\nПримеры событий фазовых переходов:")
+        for line in phase_events[:20]:
+            print(" ", line)
+
+
+# ---------------------------
+# Запуск
+# ---------------------------
+if __name__ == "__main__":
+    run_simulation()
+
